@@ -8879,9 +8879,666 @@ UI.addTab('reg', 'Registro', function () {
 }
 Object.assign(window.__G, { AU });
 
+// ---- 31_personagens.js ----
+// ================= PERSONAGENS 2.0: MODELAGEM E ANIMAÇÃO =================
+// Modelos detalhados no mesmo estilo low-poly, montados como MALHA COM ESQUELETO (skinning):
+// cada personagem vira 4–6 chamadas de desenho (antes ~20), o que paga o detalhe extra.
+// O esqueleto usa as MESMAS articulações e posições do rig original (hips, torso, head,
+// armR/armL {sh, el, hd}, legR/legL {hp, kn}, wpn, shield, cape), então todas as poses
+// existentes (ataques, lança, arco, bloqueio, magia, sentar, cenas) continuam valendo.
+// Novas articulações: tornozelos (an), olhos, boca, mandíbula, abas de roupa, saia, capa em 3 partes.
+// A animação nova é uma CAMADA sobre a pose original: marcha com quadril e ombros, respiração,
+// troca de peso, piscar, olhar para quem está perto, gestos ao falar, inclinação em curvas,
+// reação ao golpe pela direção, queda ao morrer, ajoelhar ao cair, aterrissagem, nado,
+// base de combate, pé que acompanha o chão, tecidos com mola e suavização entre poses.
+// Opção "Personagens: Clássicos" restaura exatamente o visual e a animação antigos.
+if (G.settings.chars === undefined) G.settings.chars = 'hd';
+const Chars = {
+  hd() { return G.settings.chars !== 'classic'; },
+  // ---------- materiais com esqueleto (cor por vértice → um material serve para todas as cores) ----------
+  mat(k) {
+    return MAT.get('skm_' + k, () => {
+      let m;
+      switch (k) {
+        case 'cloth': m = phong(TEX.cloth, 0xffffff, { shininess: 4 }); break;
+        case 'leather': m = phong(TEX.leather, 0xffffff, { shininess: 10 }); break;
+        case 'plate': m = phong(TEX.plate, 0xffffff, { shininess: 70, specular: 0x7a86a8 }); break;
+        case 'chain': m = phong(TEX.chain, 0xffffff, { shininess: 45, specular: 0x6a6a7a }); break;
+        case 'bone': m = phong(TEX.bone, 0xffffff, { shininess: 12 }); break;
+        case 'rock': m = phong(TEX.rock, 0xffffff, { shininess: 4 }); break;
+        case 'fur': m = phong(TEX.leather, 0xffffff, { shininess: 2 }); break;
+        case 'glow': m = new THREE.MeshBasicMaterial({ color: 0xffffff }); break;
+        case 'glowA': m = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: .8, blending: THREE.AdditiveBlending, depthWrite: false }); break;
+        case 'ghost': m = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: .5, blending: THREE.AdditiveBlending, depthWrite: false }); break;
+        default: m = phong(null, 0xffffff, { shininess: 4 });           // pele
+      }
+      m.skinning = true; m.vertexColors = true; return m;
+    });
+  },
+  // material existente (elmos, coroas) → cópia com esqueleto
+  matOf(base) { return MAT.get('skc_' + base.uuid, () => { const m = base.clone(); m.skinning = true; return m; }); },
+  // caixa afunilada: o topo (y>0) é escalado por (tx, tz)
+  taper(w, h, d, tx, tz) {
+    const g = new THREE.BoxGeometry(w, h, d), p = g.attributes.position; if (tz === undefined) tz = tx;
+    for (let i = 0; i < p.count; i++) if (p.getY(i) > 0) { p.setX(i, p.getX(i) * tx); p.setZ(i, p.getZ(i) * tz); }
+    g.computeVertexNormals(); return g;
+  },
+  // caixa afunilada na frente (z>0 escalado por fx, fy)
+  taperZ(w, h, d, fx, fy) {
+    const g = new THREE.BoxGeometry(w, h, d), p = g.attributes.position;
+    for (let i = 0; i < p.count; i++) if (p.getZ(i) > 0) { p.setX(i, p.getX(i) * fx); p.setY(i, p.getY(i) * fy); }
+    g.computeVertexNormals(); return g;
+  },
+  dispose(R) { if (R && R.skel && R.skel.dispose) { try { R.skel.dispose(); } catch (e) { } } }
+};
+// ---------- construtor de malha com esqueleto ----------
+class SkinB {
+  constructor() { this.bones = []; this.parts = []; }
+  bone(par, x, y, z) { const b = new THREE.Bone(); b.position.set(x || 0, y || 0, z || 0); par.add(b); b.userData.bi = this.bones.length; this.bones.push(b); return b; }
+  // pal = [material, cor]; sh = escurecimento na base da peça (oclusão falsa)
+  geo(bone, g, pal, x, y, z, rx, ry, rz, sh) {
+    this.parts.push({ bone, g, mat: pal[0], col: pal[1], sh: sh === undefined ? .84 : sh, m: new THREE.Matrix4().compose(V3(x || 0, y || 0, z || 0), new THREE.Quaternion().setFromEuler(new THREE.Euler(rx || 0, ry || 0, rz || 0)), V3(1, 1, 1)) });
+  }
+  box(bone, w, h, d, pal, x, y, z, rx, ry, rz, sh) { this.geo(bone, new THREE.BoxGeometry(w, h, d), pal, x, y, z, rx, ry, rz, sh); }
+  tp(bone, w, h, d, tx, tz, pal, x, y, z, rx, ry, rz, sh) { this.geo(bone, Chars.taper(w, h, d, tx, tz), pal, x, y, z, rx, ry, rz, sh); }
+  tz(bone, w, h, d, fx, fy, pal, x, y, z, rx, ry, rz, sh) { this.geo(bone, Chars.taperZ(w, h, d, fx, fy), pal, x, y, z, rx, ry, rz, sh); }
+  // malha pronta (elmo, coroa): herda o material dela
+  mesh(bone, m, x, y, z) { this.parts.push({ bone, g: m.geometry, mat: m.material, col: null, sh: 1, m: new THREE.Matrix4().compose(V3(x, y, z), m.quaternion.clone(), m.scale.clone()) }); return m; }
+  finish(body) {
+    body.updateMatrixWorld(true); const inv = new THREE.Matrix4().copy(body.matrixWorld).invert(), groups = new Map(), W = new THREE.Color(1, 1, 1);
+    for (const P of this.parts) {
+      const g = P.g.index ? P.g.toNonIndexed() : P.g.clone(); if (!g.attributes.normal) g.computeVertexNormals();
+      g.computeBoundingBox(); const y0 = g.boundingBox.min.y, hy = Math.max(1e-4, g.boundingBox.max.y - y0), c = P.col || W, pos = g.attributes.position, n = pos.count, col = new Float32Array(n * 3);
+      for (let i = 0; i < n; i++) { const f = P.sh + (1 - P.sh) * ((pos.getY(i) - y0) / hy); col[i * 3] = c.r * f; col[i * 3 + 1] = c.g * f; col[i * 3 + 2] = c.b * f; }
+      g.applyMatrix4(new THREE.Matrix4().multiplyMatrices(inv, P.bone.matrixWorld).multiply(P.m));
+      let L = groups.get(P.mat); if (!L) groups.set(P.mat, L = []); L.push({ g, col, bi: P.bone.userData.bi });
+    }
+    const meshes = [];
+    groups.forEach((L, key) => {
+      let n = 0; for (const e of L) n += e.g.attributes.position.count;
+      const Pp = new Float32Array(n * 3), N = new Float32Array(n * 3), U = new Float32Array(n * 2), C = new Float32Array(n * 3), SI = new Uint16Array(n * 4), SW = new Float32Array(n * 4); let o = 0;
+      for (const e of L) {
+        const p = e.g.attributes.position, nn = e.g.attributes.normal, uv = e.g.attributes.uv;
+        for (let i = 0; i < p.count; i++, o++) {
+          Pp[o * 3] = p.getX(i); Pp[o * 3 + 1] = p.getY(i); Pp[o * 3 + 2] = p.getZ(i); N[o * 3] = nn.getX(i); N[o * 3 + 1] = nn.getY(i); N[o * 3 + 2] = nn.getZ(i);
+          U[o * 2] = uv ? uv.getX(i) : 0; U[o * 2 + 1] = uv ? uv.getY(i) : 0; C[o * 3] = e.col[i * 3]; C[o * 3 + 1] = e.col[i * 3 + 1]; C[o * 3 + 2] = e.col[i * 3 + 2];
+          SI[o * 4] = e.bi; SW[o * 4] = 1;
+        }
+      }
+      const g = new THREE.BufferGeometry();
+      g.setAttribute('position', new THREE.BufferAttribute(Pp, 3)); g.setAttribute('normal', new THREE.BufferAttribute(N, 3)); g.setAttribute('uv', new THREE.BufferAttribute(U, 2)); g.setAttribute('color', new THREE.BufferAttribute(C, 3));
+      g.setAttribute('skinIndex', new THREE.BufferAttribute(SI, 4)); g.setAttribute('skinWeight', new THREE.BufferAttribute(SW, 4));
+      g.computeBoundingSphere(); g.boundingSphere.radius *= 1.35;
+      const m = new THREE.SkinnedMesh(g, typeof key === 'string' ? Chars.mat(key) : Chars.matOf(key)); body.add(m); meshes.push(m);
+    });
+    body.updateMatrixWorld(true);
+    const skel = new THREE.Skeleton(this.bones); meshes.forEach(m => m.bind(skel, m.matrixWorld));
+    return skel;
+  }
+}
+// ---------- humanoide ----------
+const HC = { white: new THREE.Color(1, 1, 1), chain: new THREE.Color(0xc8d0e0), plate: new THREE.Color(0xc4cadb), dark: new THREE.Color(0x4a4660), rock: new THREE.Color(0xb0b0c8), belt: new THREE.Color(0x5a4030), boot: new THREE.Color(0x6a5040), gold: new THREE.Color(0xc9a24a), black: new THREE.Color(0x050308), eye: new THREE.Color(0x1a1410), sclera: new THREE.Color(0xb4aca4), iris: new THREE.Color(0x2a1a10), lip: new THREE.Color(0x3a1c1c) };
+function hdShadow(R, sc) {
+  const sh = new THREE.Mesh(MAT.get('geo_shadow', () => new THREE.PlaneGeometry(1, 1).rotateX(-Math.PI / 2)), MAT.get('shadowm', () => new THREE.MeshBasicMaterial({ map: TEX.glow, color: 0x000000, transparent: true, opacity: .55, depthWrite: false })));
+  sh.scale.setScalar(sc); sh.position.y = .06; R.root.add(sh); R.shadow = sh;
+}
+function buildHuman2(look, opt) {
+  opt = opt || {};
+  const root = new THREE.Group(), body = new THREE.Group(); root.add(body);
+  const s = (look.s || 1) * (opt.scale || 1); body.scale.setScalar(s);
+  const R = { root, body, s, look, quad: false, hd2: true, seed: Math.random() * 100 };
+  hdShadow(R, 1.3 * s);
+  const K = look.body || 'cloth', ghost = K === 'ghost', boneK = K === 'bone', rock = K === 'rock', skinK = K === 'skin', dark = K === 'dark', armored = K === 'plate' || dark;
+  const C = h => new THREE.Color(h), mul = (c, f) => c.clone().multiplyScalar(f);
+  const tint = C(look.tint || '#888888'), skin = C(look.skin || '#c9a07a'), hair = C(look.hc || '#2a1a14'), beardC = look.beard ? C(look.beard) : null, eyesC = look.eyes ? C(look.eyes) : null;
+  const thin = look.thin ? .6 : 1, bulk = rock ? 1.35 : 1, tw = look.thin ? .8 : 1;
+  const G_ = ghost ? ['ghost', tint] : null, pal = (m, c) => G_ || [m, c];
+  const plateP = dark ? pal('plate', HC.dark) : pal('plate', HC.plate);
+  const bodyP = boneK ? pal('bone', HC.white) : rock ? pal('rock', HC.rock) : K === 'plate' || K === 'chain' ? pal('chain', HC.chain) : dark ? pal('plate', HC.dark) : K === 'leather' ? pal('leather', HC.white) : skinK ? pal('skin', tint) : pal('cloth', tint);
+  const hoodEnemy = look.helm === 'hood' && !!eyesC;
+  const skinP = boneK ? pal('bone', HC.white) : rock ? pal('rock', HC.rock) : pal('skin', hoodEnemy ? mul(skin, .32) : skin);
+  const legP = armored ? (dark ? plateP : pal('chain', HC.chain)) : K === 'chain' ? pal('chain', HC.chain) : (K === 'robe' || K === 'cloth') ? pal('leather', HC.white) : bodyP;
+  const bootP = boneK || rock || skinK || ghost ? skinP : dark ? plateP : pal('leather', HC.boot);
+  const beltP = pal('leather', HC.belt), hairP = pal('cloth', hair);
+  const b = new SkinB();
+  // ---- esqueleto (mesmas posições do rig original) ----
+  const hips = b.bone(body, 0, 1, 0), torso = b.bone(hips, 0, .08, 0), head = b.bone(torso, 0, .64, 0);
+  const eyes = b.bone(head, 0, .17, .128), mouth = b.bone(head, 0, .073, .124), jaw = b.bone(head, 0, .085, .02);
+  Object.assign(R, { hips, torso, head, eyes, mouth, jaw });
+  // ---- quadril e tronco ----
+  if (boneK) {
+    b.tp(hips, .26, .1, .15, 1.2, 1, bodyP, 0, 0, 0);
+    for (let i = 0; i < 5; i++) b.box(torso, .06, .08, .06, bodyP, 0, .06 + i * .11, -.06);
+    for (let i = 0; i < 4; i++) b.tp(torso, .3 - i * .025, .035, .2, 1.15, 1, bodyP, 0, .22 + i * .1, .02);
+    b.box(torso, .04, .3, .02, bodyP, 0, .36, .12); b.box(torso, .5, .04, .05, bodyP, 0, .58, .03);
+  } else if (rock) {
+    b.geo(hips, new THREE.IcosahedronGeometry(.24, 0), bodyP, 0, 0, 0, 0, .4, 0, .8);
+    const ch = new THREE.IcosahedronGeometry(.36, 0); ch.scale(1.2, 1, .8); b.geo(torso, ch, bodyP, 0, .38, 0, .2, .5, 0, .75);
+    if (eyesC) { b.box(torso, .03, .22, .02, ['glow', eyesC], .06, .4, .27, 0, 0, .3, 1); b.box(torso, .02, .14, .02, ['glow', eyesC], -.1, .32, .25, 0, 0, -.4, 1); }
+  } else {
+    b.tp(hips, .34 * bulk * tw, .2, .22 * bulk, 1.06, 1.04, K === 'robe' ? bodyP : legP, 0, 0, 0);
+    b.tp(torso, .35 * bulk * tw, .28, .235 * bulk, 1.12, 1.05, bodyP, 0, .14, 0);
+    b.tp(torso, .38 * bulk * tw, .34, .26 * bulk, 1.24, 1.08, bodyP, 0, .44, 0, 0, 0, 0, .9);
+    b.tp(torso, .3 * tw, .06, .2, .7, .8, bodyP, 0, .63, -.01, 0, 0, 0, 1);
+  }
+  b.box(head, .1, .1, .1, skinP, 0, -.03, 0);                      // pescoço
+  // ---- roupas e armaduras do tronco ----
+  const flap = (z, w, h, p, d) => { const f = b.bone(hips, 0, -.04, z); b.box(f, w, h, d || .03, p, 0, -h / 2, 0); return f; };
+  if (K === 'cloth') {
+    R.flapF = flap(.11, .33, .2, bodyP); R.flapB = flap(-.11, .33, .2, bodyP);
+    b.box(torso, .13, .09, .012, pal('cloth', mul(tint, .55)), 0, .57, .137, 0, 0, 0, 1);
+  }
+  if (K === 'robe') {
+    const half = (st) => { const g = new THREE.CylinderGeometry(.23, .38, .92, 10, 1, true, st, Math.PI); const bn = b.bone(hips, 0, .02, 0); b.geo(bn, g, bodyP, 0, -.46, 0); return bn; };
+    R.skirtF = half(-Math.PI / 2); R.skirtB = half(Math.PI / 2);
+    b.geo(hips, new THREE.CylinderGeometry(.21, .34, .88, 8), pal('cloth', mul(tint, .6)), 0, -.44, 0);
+    b.tp(torso, .4, .07, .27, 1.02, 1, pal('cloth', mul(tint, .62)), 0, .03, 0, 0, 0, 0, 1);
+    b.box(torso, .1, .5, .012, pal('cloth', mul(tint, 1.25)), 0, .3, .133, 0, 0, 0, .9);
+  }
+  if (ghost) { const g = new THREE.CylinderGeometry(.26, .04, 1.05, 8); b.geo(hips, g, bodyP, 0, -.5, 0); R.skirtF = null; }
+  if (K === 'leather') {
+    b.box(torso, .06, .66, .02, beltP, 0, .36, .13, 0, 0, .62); b.box(torso, .06, .66, .02, beltP, 0, .36, -.13, 0, 0, -.62);
+    b.box(torso, .09, .09, .06, beltP, .15, .01, .12); R.flapF = flap(.11, .28, .16, pal('leather', mul(HC.white, .8))); R.flapB = flap(-.11, .28, .16, pal('leather', mul(HC.white, .8)));
+  }
+  if (K === 'chain') {
+    if (look.cape) { const cp = pal('cloth', C(look.cape)); b.box(torso, .28, .48, .02, cp, 0, .3, .142); b.box(torso, .07, .09, .01, pal('plate', HC.gold), 0, .42, .155); R.flapF = flap(.12, .27, .36, cp, .02); R.flapB = flap(-.12, .27, .3, cp, .02); }
+    else { R.flapF = flap(.11, .33, .2, bodyP); R.flapB = flap(-.11, .33, .2, bodyP); }
+  }
+  if (armored) {
+    b.tp(torso, .44, .4, .3, 1.1, 1.02, plateP, 0, .41, .006, 0, 0, 0, .8);
+    b.box(torso, .38, .07, .27, plateP, 0, .19, .004); b.box(torso, .37, .07, .265, plateP, 0, .11, .004);
+    b.tp(torso, .25, .08, .23, .78, .8, plateP, 0, .63, 0);
+    R.flapF = flap(.12, .32, .22, plateP); R.flapB = flap(-.12, .32, .22, plateP);
+  }
+  if (skinK) {
+    b.box(torso, .16, .1, .04, pal('skin', mul(tint, .92)), .09, .47, .13, 0, 0, 0, .8); b.box(torso, .16, .1, .04, pal('skin', mul(tint, .92)), -.09, .47, .13, 0, 0, 0, .8);
+    R.flapF = flap(.11, .22, .24, beltP); R.flapB = flap(-.11, .22, .2, beltP);
+  }
+  if (!boneK && !rock && !ghost && !skinK && K !== 'robe') { b.tp(torso, .39 * bulk * tw, .07, .26 * bulk, 1.03, 1, beltP, 0, .03, 0, 0, 0, 0, 1); b.box(torso, .07, .06, .02, pal('plate', HC.gold), 0, .03, .135, 0, 0, 0, 1); }
+  if (look.apron) { const ap = pal('leather', C(look.apron)); b.box(torso, .32, .34, .02, ap, 0, .3, .146); b.box(torso, .03, .16, .02, ap, .1, .52, .14, 0, 0, .3); b.box(torso, .03, .16, .02, ap, -.1, .52, .14, 0, 0, -.3); R.flapA = b.bone(hips, 0, .02, .15); b.box(R.flapA, .34, .56, .02, ap, 0, -.28, 0); }
+  // capa em três segmentos (a primeira articulação é R.cape, que a pose original já move)
+  if (look.cape && !ghost) {
+    const cp = pal('cloth', C(look.cape));
+    b.box(torso, .46, .07, .11, cp, 0, .61, -.1, 0, 0, 0, 1);
+    const c1 = b.bone(torso, 0, .6, -.16), c2 = b.bone(c1, 0, -.36, 0), c3 = b.bone(c2, 0, -.36, 0);
+    b.box(c1, .46, .37, .03, cp, 0, -.18, 0, 0, 0, 0, .92); b.box(c2, .48, .37, .03, cp, 0, -.18, 0, 0, 0, 0, .9); b.tp(c3, .5, .34, .03, .98, 1, cp, 0, -.17, 0, 0, 0, 0, .8);
+    R.cape = c1; R.capeSegs = [c1, c2, c3];
+  }
+  // aljava nas costas de quem usa arco
+  const wIt = ITEMS[look.wpn]; if (wIt && wIt.wt === 'bow') { b.box(torso, .11, .48, .11, pal('leather', C('#6a4a30')), .1, .34, -.19, 0, 0, .35); for (let i = 0; i < 4; i++) b.box(torso, .025, .09, .01, pal('cloth', C('#e8e0d0')), .19 + i * .014 - .02, .62 - i * .01, -.19 + (i % 2) * .03, 0, 0, .35, 1); }
+  // ---- cabeça e rosto ----
+  const helm = look.helm, covers = helm === 'great' || helm === 'great_cone';
+  const browC = beardC || (look.hc ? hair : mul(skin, .5));
+  if (!covers) {
+    if (helm === 'skull' || boneK) {
+      b.tp(head, .2, .2, .23, 1.12, 1.05, skinP, 0, .2, 0);
+      b.tp(jaw, .15, .07, .14, 1.12, 1, skinP, 0, -.04, .02);
+      b.box(eyes, .06, .05, .02, ['glow', eyesC || HC.black], .052, 0, .005, 0, 0, 0, 1); b.box(eyes, .06, .05, .02, ['glow', eyesC || HC.black], -.052, 0, .005, 0, 0, 0, 1);
+      b.box(head, .03, .035, .01, ['glow', HC.black], 0, .13, .118, 0, 0, 0, 1); b.box(jaw, .12, .02, .012, ['glow', HC.black], 0, .0, .09, 0, 0, 0, 1);
+    } else {
+      b.tp(head, .21, .27, .24, 1.1, 1.04, skinP, 0, .15, .005, 0, 0, 0, .9);
+      if (rock) b.box(head, .23, .12, .2, skinP, 0, .06, .02);
+      if (ghost && eyesC) { b.box(eyes, .05, .03, .012, ['glow', eyesC], .055, 0, .004, 0, 0, 0, 1); b.box(eyes, .05, .03, .012, ['glow', eyesC], -.055, 0, .004, 0, 0, 0, 1); }
+      if (!rock && !ghost) {
+        const sk2 = hoodEnemy ? skinP : pal('skin', mul(skin, .86));
+        b.tp(head, .036, .06, .036, .7, .7, sk2, 0, .135, .132, -.15);
+        if (helm !== 'hood') { b.box(head, .03, .07, .05, sk2, .118, .15, -.005); b.box(head, .03, .07, .05, sk2, -.118, .15, -.005); }
+        if (!hoodEnemy) {
+          b.box(head, .065, .018, .02, pal('cloth', browC), .055, .205, .122, 0, 0, -.12, 1); b.box(head, .065, .018, .02, pal('cloth', browC), -.055, .205, .122, 0, 0, .12, 1);
+          b.box(mouth, .07, .014, .012, ['glow', HC.lip], 0, 0, 0, 0, 0, 0, 1);
+        }
+        if (hoodEnemy) b.box(head, .2, .2, .01, ['glow', HC.black], 0, .15, .127, 0, 0, 0, 1);
+      }
+      const eyeP = ['glow', eyesC || HC.eye];
+      if (rock) { b.box(eyes, .06, .05, .02, eyeP, .055, 0, .005, 0, 0, 0, 1); b.box(eyes, .06, .05, .02, eyeP, -.055, 0, .005, 0, 0, 0, 1); }
+      else if (eyesC) { b.box(eyes, .046, .03, .012, eyeP, .055, 0, .004, 0, 0, 0, 1); b.box(eyes, .046, .03, .012, eyeP, -.055, 0, .004, 0, 0, 0, 1); }
+      else if (!ghost) [-1, 1].forEach(sd => {   // esclera, íris e brilho
+        b.box(eyes, .056, .028, .008, ['glow', HC.sclera], sd * .055, 0, 0, 0, 0, 0, 1);
+        b.box(eyes, .026, .03, .01, ['glow', HC.iris], sd * .05, 0, .003, 0, 0, 0, 1);
+        b.box(eyes, .009, .009, .011, ['glow', HC.white], sd * .045 + .004, .007, .005, 0, 0, 0, 1);
+      });
+      if (beardC) {
+        const bp = pal('cloth', beardC);
+        b.tp(jaw, .2, .13, .08, 1.05, 1, bp, 0, -.035, .105, 0, 0, 0, .8); b.tp(jaw, .09, .08, .07, 1.9, 1.1, bp, 0, -.125, .1, 0, 0, 0, .75);
+        b.box(head, .13, .03, .035, bp, 0, .105, .14, 0, 0, 0, 1);
+        if (helm === 'bald') { b.box(head, .245, .07, .06, bp, 0, .18, -.115); b.box(head, .03, .07, .12, bp, .12, .18, -.05); b.box(head, .03, .07, .12, bp, -.12, .18, -.05); }
+      }
+      if (helm === 'hair') {
+        b.tp(head, .245, .08, .27, .92, .92, hairP, 0, .3, -.005, 0, 0, 0, .9); b.box(head, .245, .22, .07, hairP, 0, .19, -.12, 0, 0, 0, .8);
+        b.box(head, .035, .13, .2, hairP, .12, .23, -.02, 0, 0, 0, .85); b.box(head, .035, .13, .2, hairP, -.12, .23, -.02, 0, 0, 0, .85);
+        b.box(head, .23, .05, .05, hairP, 0, .275, .115, .25, 0, 0, 1);
+      }
+      if (helm === 'hood') {
+        const hp = pal('cloth', C(look.hc || '#4a3a5a'));
+        b.tp(head, .3, .08, .32, .85, .85, hp, 0, .31, -.02, 0, 0, 0, .95); b.box(head, .31, .36, .07, hp, 0, .15, -.145, 0, 0, 0, .8);
+        b.box(head, .045, .34, .3, hp, .152, .15, -.01, 0, 0, 0, .8); b.box(head, .045, .34, .3, hp, -.152, .15, -.01, 0, 0, 0, .8);
+        b.box(head, .31, .05, .07, hp, 0, .292, .13, .3, 0, 0, 1); b.tp(head, .12, .14, .1, .2, .2, hp, 0, .32, -.17, -.6);
+        b.tp(torso, .44, .13, .33, .72, .78, hp, 0, .6, -.01, 0, 0, 0, .85);
+      }
+    }
+  } else if (eyesC) b.box(head, .14, .025, .02, ['glow', eyesC], 0, .2, .175, 0, 0, 0, 1);
+  if (helm && helm !== 'hair' && helm !== 'hood' && helm !== 'skull' && helm !== 'bald') helmMesh(look, (m, x, y, z) => ghost ? b.geo(head, m.geometry, G_, x, y, z, m.rotation.x, m.rotation.y, m.rotation.z, 1) : b.mesh(head, m, x, y, z));
+  // ---- braços (direito = -x, esquerdo = +x) ----
+  const upP = K === 'robe' ? bodyP : (K === 'plate' || K === 'chain') ? pal('chain', HC.chain) : bodyP;
+  const loP = armored ? plateP : K === 'robe' ? bodyP : K === 'chain' ? pal('leather', HC.white) : bodyP;
+  const handP = armored ? plateP : skinP;
+  const arm = side => {
+    const sh = b.bone(torso, side * .3 * bulk, .54, 0), el = b.bone(sh, 0, -.32, 0), hd = b.bone(el, 0, -.3, 0);
+    if (boneK) {
+      b.box(sh, .06, .06, .06, bodyP, 0, -.01, 0); b.box(sh, .05, .3, .05, bodyP, 0, -.16, 0); b.box(el, .06, .06, .06, bodyP, 0, 0, 0);
+      b.box(el, .03, .27, .03, bodyP, .018, -.15, 0); b.box(el, .03, .27, .03, bodyP, -.018, -.15, 0);
+      b.box(hd, .07, .06, .04, bodyP, 0, -.02, 0); for (let i = 0; i < 3; i++) b.box(hd, .015, .07, .015, bodyP, -.022 + i * .022, -.08, .005, .2);
+    } else if (rock) {
+      b.geo(sh, new THREE.IcosahedronGeometry(.19, 0), bodyP, 0, 0, 0, .3, .2, 0, .8);
+      const u = new THREE.IcosahedronGeometry(.12, 0); u.scale(1, 1.45, 1); b.geo(sh, u, bodyP, 0, -.17, 0);
+      const f = new THREE.IcosahedronGeometry(.11, 0); f.scale(1, 1.4, 1); b.geo(el, f, bodyP, 0, -.14, 0);
+      b.geo(hd, new THREE.IcosahedronGeometry(.12, 0), bodyP, 0, -.04, 0, .4, .6, 0);
+    } else {
+      b.tp(sh, .15 * bulk, .12, .15 * bulk, .88, .9, upP, 0, -.03, 0, 0, 0, 0, .9);
+      b.tp(sh, .11 * thin * bulk, .3, .12 * thin * bulk, 1.18, 1.1, upP, 0, -.17, 0);
+      b.box(el, .1 * thin * bulk, .09, .1 * thin * bulk, loP, 0, 0, 0);
+      if (K === 'robe') b.tp(el, .16, .27, .16, .64, .64, loP, 0, -.14, 0, 0, 0, 0, .75);
+      else b.tp(el, .09 * thin * bulk, .27, .1 * thin * bulk, 1.3, 1.2, loP, 0, -.14, 0);
+      if (K === 'leather') b.box(el, .11, .11, .12, beltP, 0, -.2, 0);
+      b.box(hd, .06, .09, .09, handP, 0, -.03, 0, 0, 0, 0, .9); b.box(hd, .056, .07, .085, handP, 0, -.1, .008, .25);
+      b.box(hd, .03, .05, .03, handP, side * -.02, -.05, .05, .4);
+      if (look.wpn === 'claws') for (let i = 0; i < 3; i++) b.geo(hd, new THREE.ConeGeometry(.012, .08, 4), pal('bone', HC.white), -.02 + i * .02, -.17, .02, Math.PI - .2);
+      if (armored) {
+        b.tp(sh, .2, .1, .22, .75, .8, plateP, side * .02, .02, 0, 0, 0, side * -.25); b.tp(sh, .19, .06, .21, 1, 1, plateP, side * .04, -.06, 0, 0, 0, side * -.3);
+        b.box(el, .12, .1, .12, plateP, 0, 0, .01); b.tp(hd, .1, .06, .11, 1.1, 1, plateP, 0, .02, 0);
+        if (dark) b.geo(sh, new THREE.ConeGeometry(.035, .16, 4), plateP, side * .06, .12, 0, 0, 0, side * -.4);
+      }
+      if (K === 'chain') b.tp(sh, .18, .08, .2, .75, .8, plateP, side * .02, .02, 0, 0, 0, side * -.25);
+      if (K === 'leather') b.tp(sh, .16, .06, .18, .8, .8, bodyP, side * .01, .03, 0, 0, 0, side * -.2);
+    }
+    return { sh, el, hd };
+  };
+  R.armR = arm(-1); R.armL = arm(1);
+  // ---- pernas ----
+  const kneeP = armored ? plateP : legP, shinP = armored ? plateP : legP;
+  const leg = side => {
+    const hp = b.bone(hips, side * .11 * bulk, -.06, 0), kn = b.bone(hp, 0, -.45, 0), an = b.bone(kn, 0, -.42, 0);
+    if (look.float || ghost) return { hp, kn, an };
+    if (boneK) {
+      b.box(hp, .05, .44, .05, bodyP, 0, -.22, 0); b.box(kn, .07, .07, .07, bodyP, 0, 0, 0); b.box(kn, .04, .4, .04, bodyP, 0, -.21, 0);
+      b.box(an, .08, .04, .2, bodyP, 0, -.03, .05); return { hp, kn, an };
+    }
+    if (rock) {
+      const t = new THREE.IcosahedronGeometry(.14, 0); t.scale(1, 1.6, 1); b.geo(hp, t, bodyP, 0, -.22, 0);
+      const l = new THREE.IcosahedronGeometry(.12, 0); l.scale(1, 1.7, 1); b.geo(kn, l, bodyP, 0, -.22, 0);
+      b.box(an, .2, .1, .3, bodyP, 0, -.03, .05); return { hp, kn, an };
+    }
+    b.tp(hp, .14 * thin * bulk, .44, .16 * thin * bulk, 1.15, 1.08, legP, 0, -.22, 0);
+    b.box(kn, .12 * thin * bulk, .1, .14 * thin * bulk, kneeP, 0, 0, .008);
+    b.tp(kn, .11 * thin * bulk, .4, .12 * thin * bulk, 1.25, 1.2, shinP, 0, -.2, 0);
+    if (!armored && !skinK) b.tp(kn, .135 * bulk, .17, .145 * bulk, 1.08, 1.05, bootP, 0, -.33, 0);
+    if (armored) { b.tp(hp, .16, .26, .18, 1.1, 1.05, plateP, 0, -.16, .005); b.tp(kn, .14, .1, .15, .8, .8, plateP, 0, .01, .03); }
+    b.box(an, .13 * bulk, .075, .24 * bulk, bootP, 0, -.025, .05, 0, 0, 0, .7); b.tp(an, .12 * bulk, .06, .07, .8, .8, bootP, 0, -.03, .17);
+    return { hp, kn, an };
+  };
+  R.legR = leg(-1); R.legL = leg(1);
+  R.skel = b.finish(body);
+  // ---- arma e escudo (malhas normais presas aos ossos, como no original) ----
+  R.wpn = new THREE.Group(); R.armR.hd.add(R.wpn); R.wpn.position.y = -.05; R.wpn.rotation.x = 1.3; R.wpn.add(weaponMesh(look.wpn));
+  R.shield = new THREE.Group(); R.armL.el.add(R.shield);
+  if (look.shd && ITEMS[look.shd]) { const it = ITEMS[look.shd]; const sm = new THREE.Mesh(shieldGeo(), MAT.get('shd' + look.shd, () => phong(it.c === '#7a5530' ? TEX.wood : TEX.plate, new THREE.Color(it.c), { shininess: 60 }))); R.shield.add(sm); const bs = new THREE.Mesh(new THREE.CylinderGeometry(.07, .07, .04, 8).rotateX(Math.PI / 2), MAT.get('wgold', () => phong(null, 0xc9a24a, { shininess: 60 }))); bs.position.z = .04; R.shield.add(bs); if (look.shd === 'escudo_vigilante' || look.shd === 'escudo_reis') { const e = new THREE.Mesh(new THREE.CircleGeometry(.12, 12), lookMat('glow', 0xe9c46f)); e.position.z = .03; e.position.y = .08; R.shield.add(e); } }
+  R.hasShield = !!look.shd;
+  if (ghost) { const gm = lookMat('ghost', tint.getHex()); [R.wpn, R.shield].forEach(g => g.traverse(o => { if (o.material) o.material = gm; })); }
+  if (look.ench && R.wpn && typeof RUNE_C !== 'undefined' && RUNE_C[look.ench]) { const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: TEX.glow, color: RUNE_C[look.ench], transparent: true, opacity: .8, blending: THREE.AdditiveBlending, depthWrite: false })); sp.scale.setScalar(.9); sp.position.y = .7; R.wpn.add(sp); R.enchSp = sp; }
+  return R;
+}
+// ---------- quadrúpedes (lobo, gato, cervo, lobo estelar, Fenrik) ----------
+function buildQuad2(look, opt) {
+  opt = opt || {};
+  const root = new THREE.Group(), body = new THREE.Group(); root.add(body);
+  const s = (look.s || 1) * (opt.scale || 1), cat = look.quad === 'cat', deer = !!look.antlers, wolf = !cat && !deer;
+  const S = cat ? .45 : 1; body.scale.setScalar(S * (look.s || 1));
+  const R = { root, body, s, look, quad: true, hd2: true, seed: Math.random() * 100, cat, deer };
+  hdShadow(R, 1.6 * S);
+  const c = new THREE.Color(look.c), mul = f => c.clone().multiplyScalar(f), M = look.glow ? 'glowA' : 'fur';
+  const P = f => [M, mul(f)], dark = P(.72), belly = look.glow ? P(1) : ['fur', new THREE.Color(Math.min(1, c.r * 1.35 + .06), Math.min(1, c.g * 1.35 + .06), Math.min(1, c.b * 1.35 + .06))];
+  const eyeC = new THREE.Color(look.eye || (look.glow ? '#ffffff' : cat ? '#9aff6a' : '#ffc040'));
+  const b = new SkinB();
+  const torso = b.bone(body, 0, .66, 0), hind = b.bone(torso, 0, 0, -.12), neck = b.bone(torso, 0, .1, .36), head = b.bone(neck, 0, .06, .16), jaw = b.bone(head, 0, -.035, .17);
+  Object.assign(R, { torso, hind, neck, head, jaw });
+  // corpo: peito alto na frente, cintura fina, quadril
+  b.tz(torso, deer ? .32 : .36, deer ? .36 : .38, .5, 1.12, 1.1, P(1), 0, .02, .16, 0, 0, 0, .78);
+  if (wolf) b.tz(torso, .44, .42, .22, .9, .92, P(1.06), 0, .07, .36, 0, 0, 0, .8);
+  b.tz(hind, deer ? .3 : .32, deer ? .3 : .32, .46, 1.1, 1.06, P(.96), 0, .03, -.14, 0, 0, 0, .78);
+  b.box(torso, .28, .06, .44, belly, 0, -.17, .1, 0, 0, 0, 1);
+  b.box(torso, .16, .05, .7, P(.8), 0, .2, -.02, 0, 0, 0, 1);            // dorso mais escuro
+  // pescoço e cabeça
+  b.box(neck, deer ? .16 : .2, deer ? .3 : .24, .28, P(1), 0, deer ? .06 : 0, .02, -.5);
+  b.box(head, cat ? .28 : .26, cat ? .25 : .24, cat ? .24 : .26, P(1), 0, .05, .08, 0, 0, 0, .85);
+  b.tz(head, cat ? .14 : .15, cat ? .1 : .12, cat ? .12 : .2, .75, .8, deer ? P(.85) : belly, 0, -.01, cat ? .24 : .3, 0, 0, 0, .9);
+  b.box(head, .07, .05, .04, ['glow', new THREE.Color(0x120c10)], 0, .02, cat ? .305 : .41, 0, 0, 0, 1);
+  b.box(jaw, .12, .045, cat ? .1 : .19, belly, 0, -.01, cat ? .04 : .09, 0, 0, 0, 1);
+  if (wolf) { b.box(jaw, .1, .02, .02, ['glow', new THREE.Color(0xe8e0d0)], 0, .02, .17, 0, 0, 0, 1); b.box(head, .1, .02, .02, ['glow', new THREE.Color(0xe8e0d0)], 0, -.07, .38, 0, 0, 0, 1); }
+  [-1, 1].forEach(sd => {
+    b.box(head, .05, .032, .02, ['glow', eyeC], sd * .075, .1, .215, 0, 0, 0, 1);
+    if (deer) b.geo(head, new THREE.ConeGeometry(.05, .16, 4), P(.9), sd * .14, .15, 0, 0, 0, -sd * 1.2);
+    else b.geo(head, new THREE.ConeGeometry(cat ? .075 : .06, cat ? .17 : .16, 4), P(.9), sd * (cat ? .1 : .085), .25, .04, -.1, 0, -sd * .15);
+  });
+  if (wolf) { b.box(head, .06, .1, .12, P(1.08), .14, .02, .05, 0, 0, .3); b.box(head, .06, .1, .12, P(1.08), -.14, .02, .05, 0, 0, -.3); }
+  // cauda em três partes
+  const t1 = b.bone(hind, 0, .1, -.36), t2 = b.bone(t1, 0, 0, deer ? -.1 : cat ? -.2 : -.18), t3 = b.bone(t2, 0, 0, deer ? -.08 : cat ? -.2 : -.17);
+  if (deer) { b.box(t1, .1, .06, .12, P(1), 0, 0, -.05); b.box(t2, .08, .05, .08, belly, 0, 0, -.04); }
+  else { const w = cat ? .06 : .11; b.box(t1, w, w, cat ? .22 : .2, P(1), 0, 0, -.1); b.box(t2, w * .9, w * .9, cat ? .22 : .2, P(.95), 0, 0, -.1); b.tp(t3, w * .8, cat ? .2 : .19, w * .8, .4, .4, cat ? P(.9) : belly, 0, 0, -.09, -Math.PI / 2); }
+  R.tail = t1; R.tailSegs = [t1, t2, t3];
+  // pernas: frente no tronco, traseiras no quadril
+  R.legs = [];
+  const lw = deer ? .055 : cat ? .085 : .075;
+  [[-1, 1], [1, 1], [-1, -1], [1, -1]].forEach(([sx, sz], i) => {
+    const front = sz > 0, par = front ? torso : hind;
+    const up = b.bone(par, sx * .13, -.06, front ? .33 : -.21), lo = b.bone(up, 0, -.3, 0), paw = b.bone(lo, 0, -.3, 0);
+    if (front) b.tp(up, deer ? .08 : .1, .32, deer ? .1 : .13, 1.25, 1.2, P(.97), 0, -.15, 0, 0, 0, 0, .8);
+    else b.tp(up, deer ? .1 : .12, .32, deer ? .15 : .2, 1.3, 1.2, P(.97), 0, -.14, -.02, 0, 0, 0, .8);
+    b.box(lo, lw, .3, lw + .01, P(.9), 0, -.15, 0, 0, 0, 0, .8);
+    b.box(paw, deer ? .07 : .1, .06, deer ? .09 : .14, deer ? ['fur', new THREE.Color(0x1a1410)] : dark, 0, -.02, .03, 0, 0, 0, 1);
+    R.legs.push({ up, lo, paw, front, ph: (i === 0 || i === 3) ? 0 : Math.PI });
+  });
+  R.skel = b.finish(body);
+  if (deer) {   // chifres (mesmo desenho do cervo original) e pernas mais longas
+    const m = MAT.get('antler', () => phong(TEX.bone, 0xd8c8a0));
+    [-1, 1].forEach(sd => { const a = new THREE.Mesh(boxG(.04, .34, .04), m); a.position.set(sd * .09, .38, .02); a.rotation.z = -sd * .35; head.add(a); const t = new THREE.Mesh(boxG(.04, .18, .04), m); t.position.set(sd * .17, .5, .06); t.rotation.z = -sd * .9; head.add(t); });
+    R.legs.forEach(L => L.up.scale.y = 1.25);
+  }
+  return R;
+}
+// ---------- camada de animação ----------
+const Anim2 = {
+  JOINTS: ['hips', 'torso', 'head'],
+  tmpQ: new THREE.Quaternion(),
+  // move do corpo no mundo (derivado da matriz: vale para atores, jogadores remotos e cenas)
+  motion(R, t) {
+    const dt = R._t === undefined ? 0 : clamp(t - R._t, 0, .1); R._t = t;
+    const m = R.root.matrixWorld.elements, x = m[12], z = m[14], yaw = Math.atan2(m[8], m[10]);
+    let sp = 0, yr = 0;
+    if (dt > 0 && R._px !== undefined) { sp = Math.hypot(x - R._px, z - R._pz) / dt; if (sp > 25) sp = 0; yr = wrapAng(yaw - R._py) / dt; if (Math.abs(yr) > 12) yr = 0; }
+    R._px = x; R._pz = z; R._py = yaw;
+    const k = 1 - Math.exp(-7 * dt), sp0 = R._sp || 0;
+    R._sp = lerp(sp0, sp, k); R._ac = lerp(R._ac || 0, dt > 0 ? clamp((R._sp - sp0) / dt, -25, 25) : 0, k); R._yr = lerp(R._yr || 0, yr, k);
+    return dt;
+  },
+  spring(o, tgt, dt, kS, kD) { o.v += ((tgt - o.x) * kS - o.v * kD) * dt; o.x += o.v * dt; return o.x; },
+  human(R, s, t, dt, A) {
+    const mv = s.mv || 0, ph = s.walk || 0, run = s.run ? 1 : 0, sit = s.sit || 0, seed = R.seed;
+    const atk = s.atk >= 0, busy = atk || s.cast > .05 || s.bow > 0 || (s.blk || 0) > .05, alive = !A || A.alive;
+    const Ar = R.armR, Al = R.armL, LL = R.legL, LR = R.legR, stand = 1 - sit;
+    Ar.hd.rotation.set(0, 0, 0); Al.hd.rotation.set(0, 0, 0); R.hips.position.x = 0; R.body.rotation.z = 0;
+    R.eyes.scale.set(1, 1, 1); R.mouth.scale.set(1, 1, 1); R.jaw.rotation.set(0, 0, 0);
+    const downed = A && A.alive && (A.down > 0 || A.ai === 'down');
+    if ((s.dead > 0 && !downed) || downed) { this.fall(R, s, dt, A, downed); this.feet(R, 0, 0, 1); this.cloth(R, s, t, dt, 0); this.smooth(R, s, dt); return; }
+    R._dd = 0; R._kn = 0;
+    // 1) marcha: pelve gira e cai, ombros contra-giram, cabeça estabiliza, braços dobram na corrida
+    if (mv > .01 && stand > .5) {
+      const w = Math.sin(ph), cc = Math.cos(ph), q = mv * (A && A.swim ? 0 : 1);
+      R.hips.rotation.y -= w * .13 * q; R.hips.rotation.z += cc * .045 * q;
+      R.torso.rotation.y += w * (busy ? .05 : .24) * q; R.torso.rotation.z -= cc * .03 * q;
+      R.torso.rotation.x += (run ? .16 : .04) * q; R.head.rotation.x -= (run ? .12 : .03) * q; R.head.rotation.y -= w * .1 * q;
+      if (!busy) { Ar.el.rotation.x -= (run ? .6 : .18) * q; Ar.sh.rotation.z -= run * .1 * q; if (!R.hasShield) { Al.el.rotation.x -= (run ? .6 : .18) * q; Al.sh.rotation.z += run * .1 * q; } }
+    }
+    // 2) parado: respiração, troca de peso, olhar em volta, braços soltos
+    const idle = clamp(1 - mv * 1.6, 0, 1) * stand * (busy ? 0 : 1) * (alive ? 1 : 0);
+    const br = Math.sin(t * 1.7 + seed);
+    R.torso.rotation.x += br * .014 * stand; Ar.sh.rotation.z -= br * .015 * stand; Al.sh.rotation.z += br * .015 * stand; R.head.rotation.x -= br * .01;
+    if (idle > 0) {
+      const ws = Math.sin(t * .45 + seed * 3) * idle;
+      R.hips.position.x = ws * .03; R.hips.rotation.z += ws * .04; R.torso.rotation.z -= ws * .055; R.head.rotation.z += ws * .03;
+      LL.hp.rotation.z -= ws * .04; LR.hp.rotation.z -= ws * .04;
+      const rl = ws > 0 ? LR : LL, rk = Math.abs(ws) * .16; rl.kn.rotation.x += rk; rl.hp.rotation.x -= rk * .45;
+      Ar.sh.rotation.x += Math.sin(t * 1.1 + seed) * .025 * idle; if (!R.hasShield) Al.sh.rotation.x += Math.sin(t * 1.1 + seed + 1) * .025 * idle;
+    }
+    // 3) base de combate: inimigo atento e parado dobra joelhos e ergue a arma
+    if (A && A.kind === 'enemy' && A.aware && alive && !busy && !(A.stun > 0)) {
+      const g = clamp(1 - mv * 1.4, 0, 1) * stand;
+      R.hips.position.y -= .07 * g; LL.hp.rotation.x -= .3 * g; LR.hp.rotation.x += .16 * g; LL.kn.rotation.x += .42 * g; LR.kn.rotation.x += .3 * g;
+      R.torso.rotation.x += .1 * g; R.head.rotation.x -= .1 * g; Ar.sh.rotation.x -= .45 * g; Ar.el.rotation.x -= .55 * g;
+      if (!R.hasShield) { Al.sh.rotation.x -= .3 * g; Al.el.rotation.x -= .5 * g; }
+      if (R.look.hunch) R.torso.rotation.z += Math.sin(t * 2.2 + seed) * .06 * g;
+    }
+    // 4) olhar: NPC acompanha o jogador por perto; inimigo acompanha o alvo; jogador olha para onde a câmera aponta
+    let ly = 0, lp = 0, look = 0;
+    if (A && alive) {
+      let tg = null;
+      if (A === G.p) { if (G.state === 'dialog' && UI.talkTo) tg = UI.talkTo; else if (!busy && G.state === 'play') { const d = wrapAng(Cam.yaw - A.yaw); if (Math.abs(d) < 1.7) { ly = clamp(d, -1, 1); look = 1; } } }
+      else {
+        if ((A.kind === 'npc' || A.kind === 'ally') && G.p && G.p.alive && A.dist(G.p) < 7 && !(A.st.sit > .5 && A.dist(G.p) > 4)) tg = G.p;
+        if (A.kind === 'enemy' && A.aware && A.target && A.target.pos) tg = A.target;
+        if (UI.talkTo === A) tg = G.p;
+      }
+      if (tg) {
+        const d = wrapAng(Math.atan2(tg.pos.x - A.pos.x, tg.pos.z - A.pos.z) - A.yaw);
+        if (Math.abs(d) < 2.1) { ly = clamp(d, -1.1, 1.1); const dh = (tg.pos.y + (tg.h || 1.8) * .9) - (A.pos.y + A.h * .9); lp = clamp(-Math.atan2(dh, Math.max(.5, A.dist(tg))), -.45, .45); look = 1; }
+      }
+    }
+    const lk = 1 - Math.exp(-5 * dt); R._ly = lerp(R._ly || 0, ly, lk); R._lp = lerp(R._lp || 0, lp, lk); R._lw = lerp(R._lw || 0, look, lk);
+    R.head.rotation.y += R._ly * .72; R.head.rotation.x += R._lp * .8; if (!busy) R.torso.rotation.y += R._ly * .22 * stand;
+    if (idle > 0) { const la = 1 - R._lw; R.head.rotation.y += Math.sin(t * .31 + seed) * Math.sin(t * .17 + seed * 1.7) * .5 * idle * la; R.head.rotation.x += Math.sin(t * .23 + seed * 2) * .05 * idle * la; }
+    // 5) conversa: gestos e boca enquanto a fala "acontece"
+    if (A && UI.talkTo === A && G.state === 'dialog') {
+      if (R._dlg !== UI._talkId) { R._dlg = UI._talkId; R._talk = UI._talkDur || 2; }
+      const g = clamp(R._talk || 0, 0, 1); R._talk = Math.max(0, (R._talk || 0) - dt);
+      if (!A.look.quad && stand > .5) {
+        Ar.sh.rotation.x -= (.3 + .25 * Math.sin(t * 1.9 + seed)) * g; Ar.el.rotation.x -= (.55 + .2 * Math.sin(t * 2.7)) * g; Ar.sh.rotation.z -= .12 * g; Ar.hd.rotation.y = .6 * g;
+        if (!R.hasShield) { Al.sh.rotation.x -= (.18 + .2 * Math.sin(t * 1.5 + 2)) * g; Al.el.rotation.x -= .4 * g; Al.sh.rotation.z += .1 * g; }
+        R.head.rotation.x += Math.sin(t * 3.3) * .04 * g; R.head.rotation.z += Math.sin(t * 1.3) * .04 * g;
+      }
+      R.mouth.scale.y = 1 + g * Math.abs(Math.sin(t * 11 + Math.sin(t * 3.7) * 2)) * 2.4; R.jaw.rotation.x = g * Math.abs(Math.sin(t * 11)) * .08;
+    }
+    if (R.look.helm === 'skull' && alive) R.jaw.rotation.x = Math.max(R.jaw.rotation.x, atk ? .35 * Math.sin(s.atk * Math.PI) : (A && A.aware ? Math.abs(Math.sin(t * 9 + seed)) * .12 : 0));
+    // 6) inclinação em curvas e ao acelerar/frear
+    if (stand > .5 && !(A && A.swim)) { R.torso.rotation.z += clamp(-R._yr * R._sp * .012, -.22, .22); R.torso.rotation.x += clamp(R._ac * .018, -.12, .14); }
+    // 7) reação ao golpe pela direção
+    const h = s.hurt || 0;
+    if (h > 0) {
+      const d = R._hd || 0, hh = R._hh || .6, sd = Math.sin(d), back = Math.max(0, -Math.cos(d));
+      R.torso.rotation.z += sd * .34 * h * hh; R.head.rotation.z += sd * .25 * h * hh; R.torso.rotation.x += back * .7 * h * hh + .1 * h * hh;
+      R.head.rotation.x -= .15 * h * hh; R.hips.position.y -= .06 * h * hh; LL.kn.rotation.x += .3 * h * hh; LR.kn.rotation.x += .3 * h * hh;
+      if (!atk) { Ar.sh.rotation.z -= .35 * h * hh; if (!R.hasShield) Al.sh.rotation.z += .35 * h * hh; }
+      R.eyes.scale.y = Math.max(.15, 1 - h * 1.5);
+    }
+    // 8) golpe: passo à frente, quadril gira, peso desce (só golpes de lâmina comuns, parado)
+    if (atk && (s.var === 0 || s.var === 1) && !(s.bow > 0)) {
+      const k = s.atk, g = clamp(1 - mv * 1.5, 0, 1) * stand; let st = 0, wind = 0;
+      if (k < .35) wind = smooth(k / .35); else if (k < .6) { st = smooth((k - .35) / .25); wind = 1 - st; } else st = 1 - smooth((k - .6) / .4);
+      R.torso.rotation.y += wind * .22 * g * (s.var === 1 ? .3 : 1); R.hips.rotation.y += (wind * .12 - st * .22) * g;
+      LL.hp.rotation.x -= .5 * st * g; LL.kn.rotation.x += .28 * st * g; LR.hp.rotation.x += .32 * st * g; LR.kn.rotation.x += .16 * st * g;
+      R.hips.position.y -= (.07 * st + .03 * wind) * g; R.torso.rotation.x += .08 * st * g; R.head.rotation.y -= R.torso.rotation.y * .45;
+    }
+    // 9) no ar, aterrissagem e nado
+    if (A) {
+      if (!A.ground && !A.swim && stand > .5) { R._air = (R._air || 0) + dt; if (R._air > .12 && !busy) { Ar.sh.rotation.x -= .35; Ar.sh.rotation.z -= .3; if (!R.hasShield) { Al.sh.rotation.x -= .35; Al.sh.rotation.z += .3; } } }
+      else { if ((R._air || 0) > .35) R._land = Math.min(1, R._air * 1.4); R._air = 0; }
+      if (A.swim && stand > .5) {
+        const sw = t * (mv > .1 ? 4.2 : 1.6);
+        R.torso.rotation.x += .5 * (mv > .1 ? 1 : .3); R.head.rotation.x -= .45 * (mv > .1 ? 1 : .3);
+        if (!busy) { Ar.sh.rotation.set(-2 + Math.sin(sw) * .9, 0, -.7 - Math.cos(sw) * .4); Ar.el.rotation.x = -.6 + Math.cos(sw) * .4; Al.sh.rotation.set(-2 + Math.sin(sw) * .9, 0, .7 + Math.cos(sw) * .4); Al.el.rotation.x = -.6 + Math.cos(sw) * .4; }
+        LL.hp.rotation.x = Math.sin(sw * 1.6) * .35; LR.hp.rotation.x = -Math.sin(sw * 1.6) * .35; LL.kn.rotation.x = .3 + Math.max(0, Math.sin(sw * 1.6)) * .4; LR.kn.rotation.x = .3 + Math.max(0, -Math.sin(sw * 1.6)) * .4;
+      }
+    }
+    if (R._land > 0) {
+      R._land = Math.max(0, R._land - dt * 3.5); const l = Math.sin(Math.min(1, R._land) * Math.PI * .5);
+      R.hips.position.y -= .15 * l; LL.kn.rotation.x += .65 * l; LR.kn.rotation.x += .65 * l; LL.hp.rotation.x -= .32 * l; LR.hp.rotation.x -= .32 * l; R.torso.rotation.x += .22 * l;
+      if (!busy) { Ar.sh.rotation.z -= .35 * l; if (!R.hasShield) Al.sh.rotation.z += .35 * l; }
+    }
+    // 10) piscar (quem tem olhos brilhando não pisca)
+    if (!R.look.eyes && alive) {
+      if (R._bl === undefined) R._bl = rnd(1, 4);
+      R._bl -= dt; if (R._bl < 0) { R._bl = rnd(2.2, 5.5); R._blT = .13; if (Math.random() < .15) R._bl = .25; }
+      if (R._blT > 0) { R._blT -= dt; R.eyes.scale.y = .12; }
+    }
+    this.feet(R, mv * stand * (A && A.swim ? 0 : 1), ph, stand);
+    this.cloth(R, s, t, dt, mv);
+    this.smooth(R, s, dt);
+  },
+  // pés acompanham o chão: planos no apoio, calcanhar no contato, ponta no impulso
+  feet(R, mv, ph, stand) {
+    const one = (L, f) => { if (!L.an) return; let a = -(L.hp.rotation.x + L.kn.rotation.x) * .9 * stand; if (mv > .01) a += (f > 0 ? -.22 * f : -.5 * f) * mv; L.an.rotation.set(a, 0, 0); };
+    one(R.legL, Math.sin(ph)); one(R.legR, -Math.sin(ph));
+  },
+  // tecidos: capa com mola, saia e abas empurradas pelas pernas
+  cloth(R, s, t, dt, mv) {
+    const fwd = Math.min(R.legL.hp.rotation.x, R.legR.hp.rotation.x), bk = Math.max(R.legL.hp.rotation.x, R.legR.hp.rotation.x);
+    if (R.skirtF) R.skirtF.rotation.set(Math.min(0, fwd) * .6, 0, 0);
+    if (R.skirtB) R.skirtB.rotation.set(Math.max(0, bk) * .55 + (R._sp || 0) * .012, 0, 0);
+    if (R.flapF) R.flapF.rotation.set(Math.min(0, fwd) * .85, 0, 0);
+    if (R.flapB) R.flapB.rotation.set(Math.max(0, bk) * .8 + (R._sp || 0) * .02, 0, 0);
+    if (R.flapA) R.flapA.rotation.set(Math.min(0, fwd) * .8, 0, 0);
+    if (R.capeSegs && dt > 0) {
+      const S = R._cs || (R._cs = R.capeSegs.map(() => ({ x: 0, v: 0, z: 0, vz: 0 })));
+      const sp = clamp(R._sp || 0, 0, 12), sit = s.sit || 0, dead = s.dead || 0;
+      for (let i = 1; i < R.capeSegs.length; i++) {
+        const tg = (.05 * i + sp * .028 + Math.sin(t * 5.5 + i * 1.3 + R.seed) * (.015 + .012 * sp) + clamp((R._ac || 0) * .012, -.08, .2)) * (1 - sit) * (1 - dead) - sit * .5 * (i === 1 ? 1 : 0);
+        R.capeSegs[i].rotation.x = this.spring(S[i], tg, dt, 90, 11);
+        const tz = clamp((R._yr || 0) * .06 * i, -.35, .35) * (1 - dead); S[i].vz += ((tz - S[i].z) * 70 - S[i].vz * 10) * dt; S[i].z += S[i].vz * dt; R.capeSegs[i].rotation.z = S[i].z;
+      }
+    }
+  },
+  // queda ao morrer (joelhos cedem, depois o corpo tomba) ou ajoelhar ao ser derrubado
+  fall(R, s, dt, A, downed) {
+    const Ar = R.armR, Al = R.armL, LL = R.legL, LR = R.legR;
+    if (downed) {
+      R._kn = Math.min(1, (R._kn || 0) + dt * 3); const K = smooth(R._kn);
+      R.body.rotation.x = 0; R.body.position.y = 0;
+      R.hips.position.y = lerp(1, .52, K); R.hips.rotation.set(0, 0, 0);
+      LL.hp.rotation.set(-1.45 * K, 0, 0); LL.kn.rotation.x = 1.5 * K; LR.hp.rotation.set(.05 * K, 0, 0); LR.kn.rotation.x = 1.55 * K;
+      R.torso.rotation.set(.5 * K, 0, 0); R.head.rotation.set(.45 * K, 0, 0);
+      Ar.sh.rotation.set(-.15 * K, 0, -.12); Ar.el.rotation.x = -.3 * K; Al.sh.rotation.set(-.85 * K, 0, .15); Al.el.rotation.x = -.9 * K;
+      return;
+    }
+    if (!R._dd) { R._dd = R._dd === undefined && (s.dead || 0) >= .99 ? 1 : 0; R._dfw = R._hd !== undefined && Math.cos(R._hd) < -.3 ? 1 : 0; R._dsd = Math.random() < .5 ? -1 : 1; }
+    R._dd = Math.min(1, R._dd + dt * 1.25); const D = R._dd, a = smooth(D / .38), f = smooth((D - .22) / .6), fw = R._dfw ? -1 : 1, sd = R._dsd || 1;
+    R.body.rotation.x = -fw * Math.PI / 2 * f; R.body.rotation.z = sd * .18 * f;
+    R.body.position.y = f * .18 * R.s + Math.sin(clamp((D - .78) / .2, 0, 1) * Math.PI) * .05 * R.s;
+    R.hips.position.y = lerp(lerp(1, .6, a), .98, f); R.hips.rotation.set(0, 0, 0);
+    const kn = lerp(1.5 * a, .35, f), hp = lerp(-1.1 * a, -.08, f);
+    LL.hp.rotation.set(hp, 0, .25 * f * sd); LR.hp.rotation.set(hp * .8, 0, -.12 * f * sd); LL.kn.rotation.x = kn; LR.kn.rotation.x = kn * .5;
+    R.torso.rotation.set(lerp(.45 * a, fw > 0 ? -.12 : .1, f), .15 * f * sd, 0);
+    R.head.rotation.set(lerp(.35 * a, fw > 0 ? -.25 : .2, f), .75 * f * sd, 0);
+    if (fw > 0) { Ar.sh.rotation.set(lerp(-.2, -.5, f), 0, lerp(-.1, -1.25, f)); Al.sh.rotation.set(lerp(-.2, -.35, f), 0, lerp(.1, 1.05, f)); }
+    else { Ar.sh.rotation.set(lerp(-.2, -2.4, f), 0, lerp(-.1, -.4, f)); Al.sh.rotation.set(lerp(-.2, -2.2, f), 0, lerp(.1, .5, f)); }
+    Ar.el.rotation.set(-.35 * f, 0, 0); Al.el.rotation.set(-.3 * f, 0, 0);
+    R.eyes.scale.y = .12; if (R.look.helm === 'skull') R.jaw.rotation.x = .3 * f;
+  },
+  // suavização entre poses (sem atrasar golpes: durante ataques a pose é aplicada direto)
+  smooth(R, s, dt) {
+    const J = R._J || (R._J = [R.hips, R.torso, R.head, R.armR.sh, R.armR.el, R.armL.sh, R.armL.el, R.legL.hp, R.legL.kn, R.legR.hp, R.legR.kn, R.wpn, R.legL.an, R.legR.an].filter(Boolean));
+    const Q = R._Q || (R._Q = J.map(o => o.quaternion.clone())), crisp = s.atk >= 0 || s.bow > 0 || dt <= 0 || !R._Qok;
+    const k = crisp ? 1 : 1 - Math.exp(-15 * dt);
+    for (let i = 0; i < J.length; i++) { if (k >= 1) Q[i].copy(J[i].quaternion); else { Q[i].slerp(J[i].quaternion, k); J[i].quaternion.copy(Q[i]); } }
+    const hy = R.hips.position.y; R._hy = crisp || R._hy === undefined ? hy : lerp(R._hy, hy, k); R.hips.position.y = R._hy;
+    R._Qok = 1;
+  },
+  // ---------- quadrúpedes ----------
+  quad(R, s, t, dt, A) {
+    const mv = s.mv || 0, ph = (s.walk || 0) * 1.2, run = s.run ? 1 : 0, seed = R.seed, alive = !A || A.alive;
+    R._gal = lerp(R._gal || 0, run && mv > .6 ? 1 : 0, 1 - Math.exp(-6 * dt)); const gal = R._gal;
+    const GOFF = [0, .55, Math.PI + .1, Math.PI + .65];
+    R.body.rotation.set(0, 0, 0); R.body.position.set(0, 0, 0);
+    R.legs.forEach((L, i) => {
+      const off = lerp(L.ph, GOFF[i], gal), a = Math.sin(ph * (1 + gal * .15) + off) * (.55 + .3 * gal) * mv;
+      if (L.front) { L.up.rotation.set(a, 0, 0); L.lo.rotation.set(Math.max(0, -a) * .9, 0, 0); }
+      else { L.up.rotation.set(a + .12, 0, 0); L.lo.rotation.set(-.35 - Math.max(0, a) * .8, 0, 0); }
+      L.paw.rotation.set(-(L.up.rotation.x + L.lo.rotation.x) * .85 + (a < 0 ? .25 * mv : 0), 0, 0);
+    });
+    const bob = Math.abs(Math.cos(ph)) * .045 * mv * (1 - gal) + Math.sin(ph * 2.3) * .06 * gal;
+    R.torso.position.set(0, .66 + bob, 0); R.torso.rotation.set(Math.sin(ph * 1.15) * .1 * gal, 0, clamp(-(R._yr || 0) * (R._sp || 0) * .01, -.2, .2));
+    R.hind.rotation.set(-Math.sin(ph * 1.15) * .12 * gal, clamp((R._yr || 0) * .12, -.3, .3), 0);
+    R.neck.rotation.set(-.1 + Math.sin(ph * 2) * .05 * mv + gal * .15, clamp((R._yr || 0) * .12, -.4, .4), 0);
+    R.head.rotation.set(0, 0, 0); R.jaw.rotation.set(0, 0, 0);
+    // parado: respira, olha em volta, fareja; ofegante depois de correr
+    const idle = clamp(1 - mv * 1.5, 0, 1) * (alive ? 1 : 0);
+    R._run = clamp((R._run || 0) + (mv > .7 ? dt * .5 : -dt * .12), 0, 1);
+    if (idle > 0) {
+      R.torso.position.y += Math.sin(t * (2 + R._run * 5) + seed) * .012 * idle;
+      R._sn = (R._sn || rnd(3, 8)) - dt; if (R._sn < 0) R._sn = rnd(4, 10);
+      const sniff = R._sn < 1.2 ? Math.sin(R._sn / 1.2 * Math.PI) : 0;
+      R.neck.rotation.x += (.55 * sniff) * idle; R.head.rotation.y = Math.sin(t * .4 + seed) * Math.sin(t * .23 + seed) * .5 * idle * (1 - sniff);
+      if (!R.cat && !R.deer) R.jaw.rotation.x = R._run * (.22 + Math.sin(t * 9) * .07) * idle;
+    }
+    // inimigo atento: cabeça baixa, rosnado
+    const aware = A && A.kind === 'enemy' && A.aware && alive;
+    if (aware && !(s.atk >= 0)) { const g = idle; R.torso.position.y -= .07 * g; R.neck.rotation.x += .25 * g; R.jaw.rotation.x = Math.max(R.jaw.rotation.x, (.12 + Math.sin(t * 20) * .03) * g); R.legs.forEach(L => { if (L.front) L.up.rotation.x -= .15 * g; else L.lo.rotation.x -= .15 * g; }); }
+    // cauda: segue o corpo, abana parada, alta em alerta, baixa quando ferida
+    const tb = R.cat ? -1.05 : R.deer ? .2 : (aware ? .15 : .45) + gal * -.15;
+    const wag = Math.sin(t * (idle > .5 ? (R.cat ? 1.6 : 3.2) : 7) + seed) * (idle > .5 ? .35 : .15);
+    R.tailSegs.forEach((q, i) => q.rotation.set(i === 0 ? tb + (s.hurt || 0) * .6 : (R.cat ? -.25 : .12) + Math.sin(t * 2 + i) * .04, wag * (1 + i * .5), 0));
+    // ataque: agacha, avança, abre a boca na mordida
+    if (s.atk >= 0) {
+      const k = s.atk, l = k < .4 ? smooth(k / .4) : 1 - smooth((k - .4) / .6), bite = k > .3 && k < .62 ? Math.sin((k - .3) / .32 * Math.PI) : 0, crouch = k < .3 ? smooth(k / .3) : 0;
+      R.torso.position.z = l * .32; R.torso.position.y -= crouch * .1; R.torso.rotation.x -= l * .12;
+      R.neck.rotation.x += .35 * l - .2 * bite; R.jaw.rotation.x = .75 * bite; R.head.rotation.x = -.25 * bite;
+      R.legs.forEach(L => { if (L.front) L.up.rotation.x -= .6 * l; else { L.up.rotation.x += .3 * crouch; L.lo.rotation.x -= .3 * crouch; } });
+    } else R.torso.position.z = 0;
+    // sentado (gato/lobo)
+    if (s.sit > 0) { R.legs.forEach(L => { if (!L.front) { L.up.rotation.x = -1.2 * s.sit; L.lo.rotation.x = 1.8 * s.sit; L.paw.rotation.x = -.5 * s.sit; } }); R.torso.rotation.x = -.35 * s.sit; R.torso.position.y -= .18 * s.sit; R.neck.rotation.x -= .25 * s.sit; }
+    if (s.hurt > 0) { R.torso.rotation.z += s.hurt * .2; R.torso.position.z -= s.hurt * .12; R.jaw.rotation.x = Math.max(R.jaw.rotation.x, s.hurt * .35); }
+    // morte: tomba de lado, pernas soltas
+    const d = s.dead || 0;
+    if (d > 0) {
+      const D = smooth(d); R.body.rotation.z = Math.PI / 2 * D; R.body.position.y = D * .2;
+      R.legs.forEach((L, i) => { L.up.rotation.x = lerp(L.up.rotation.x, (i % 2 ? .35 : -.25), D); L.lo.rotation.x = lerp(L.lo.rotation.x, .45, D); });
+      R.neck.rotation.x = lerp(R.neck.rotation.x, .35, D); R.jaw.rotation.x = .25 * D; R.tailSegs.forEach(q => q.rotation.set(0, .2 * D, 0));
+    }
+    // suavização
+    const J = R._J || (R._J = [R.torso, R.hind, R.neck, R.head, R.jaw, ...R.legs.flatMap(L => [L.up, L.lo, L.paw])]);
+    const Q = R._Q || (R._Q = J.map(o => o.quaternion.clone())), k = s.atk >= 0 || dt <= 0 || !R._Qok ? 1 : 1 - Math.exp(-16 * dt);
+    for (let i = 0; i < J.length; i++) { if (k >= 1) Q[i].copy(J[i].quaternion); else { Q[i].slerp(J[i].quaternion, k); J[i].quaternion.copy(Q[i]); } }
+    R._Qok = 1;
+  }
+};
+// ---------- ganchos ----------
+{
+  const _br = buildRig;
+  buildRig = function (look, opt) {
+    if (!Chars.hd() || look.spider) return _br(look, opt);
+    try { return look.quad ? buildQuad2(look, opt) : buildHuman2(look, opt); }
+    catch (e) { console.error(e); return _br(look, opt); }
+  };
+  const _pose = poseRig;
+  poseRig = function (R, s, t) {
+    if (!R.hd2) return _pose(R, s, t);
+    const dt = Anim2.motion(R, t), A = R.root.userData.actor || null;
+    if (R.quad) return Anim2.quad(R, s, t, dt, A);
+    _pose(R, s, t);
+    Anim2.human(R, s, t, dt, A);
+  };
+  // libera o esqueleto antigo ao trocar de visual ou remover
+  const _rb = Actor.prototype.rebuild;
+  Actor.prototype.rebuild = function (look) { const old = this.rig; _rb.call(this, look); if (old !== this.rig) Chars.dispose(old); };
+  const _rm = Actor.prototype.remove;
+  Actor.prototype.remove = function () { _rm.call(this); Chars.dispose(this.rig); };
+  if (typeof Remote !== 'undefined') { const _bd = Remote.prototype.build; Remote.prototype.build = function (look) { const old = this.rig; const r = _bd.call(this, look); if (old && old !== this.rig) Chars.dispose(old); return r; }; }
+  // direção e força do último golpe (para a reação e a queda)
+  HurtPipe.post(ctx => { const t = ctx.t; if (!t || !t.rig || !(ctx.dealt > 0)) return; const src = ctx.src || (ctx.o && ctx.o.proj); const sp = src && (src.pos || src.p); t.rig._hd = sp ? wrapAng(Math.atan2(sp.x - t.pos.x, sp.z - t.pos.z) - t.yaw) : 0; t.rig._hh = ctx.dealt >= (t.hpMax || 100) * .12 ? 1 : .6; }, 60);
+  // fala: tempo de "boca mexendo" proporcional ao texto
+  const _sn = UI.showNode.bind(UI);
+  UI.showNode = function (key) { _sn(key); const tx = $('dialog') && $('dialog').querySelector('.dt'); UI._talkId = (UI._talkId || 0) + 1; UI._talkDur = clamp(.8 + (tx ? tx.textContent.length : 40) * .028, 1, 5); };
+  // durante o diálogo, quem conversa continua vivo (o laço principal não anima atores nesse estado)
+  Ext.onPost(dt => { if (G.state !== 'dialog' || !Chars.hd()) return; const a = UI.talkTo; if (a && a.rig && a.alive) { a.vel.set(0, 0, 0); a.anim(dt, G.t); } if (G.p && G.p.rig) { G.p.vel.set(0, 0, 0); G.p.anim(dt, G.t); } }, 20);
+  // opção nas configurações
+  const _opt = UI.options.bind(UI);
+  UI.options = function (back) {
+    _opt(back); const det = $('modal').querySelector('.det'); if (!det) return;
+    det.insertAdjacentHTML('beforeend', '<div class="opt"><span>Personagens</span><select id="o_chars" style="background:#140e24;color:var(--parch);border:1px solid var(--edge);padding:4px"><option value="hd"' + (Chars.hd() ? ' selected' : '') + '>Detalhados (modelos e animação novos)</option><option value="classic"' + (Chars.hd() ? '' : ' selected') + '>Clássicos</option></select></div>');
+    $('o_chars').onchange = () => { G.settings.chars = $('o_chars').value; saveSettings(); Chars.rebuildAll(); };
+  };
+  Chars.rebuildAll = function () {
+    for (const a of ACT.slice()) {
+      const old = a.rig, extra = old.root.children.filter(c => c !== old.body && c !== old.shadow);
+      const st = { sit: a.st.sit, seatH: a.st.seatH };
+      a.rebuild(a.look); extra.forEach(c => a.rig.root.add(c)); if (a.elite) a.rig.body.scale.multiplyScalar(1.1);
+      Object.assign(a.st, st);
+    }
+    if (typeof Net !== 'undefined' && Net.R) for (const r of Net.R.values()) r.lk = '';
+  };
+}
+Object.assign(window.__G, { Chars, Anim2, buildHuman2, buildQuad2 });
+
 // ---- 99_exportacoes.js ----
 // Reexporta para a ferramenta de depuração (window.__G) as versões atuais das funções envolvidas pelos módulos.
-Object.assign(window.__G, { hurt, kill, spawnEnemy, updateAI, updatePlayer, step, castSpell, stats, consume, meleeStrike, restAtFire, respawnAtFire, readTome, useHot, equip, freshState, snapshot, applySave, applyWorldState, fireBolt, findInteract, onKey, newGame, loadGame, toTitle, saveGame, playerDeath, tickStatus, fireMenu, bossMove, spawnAllEnemies, openChest, enterDungeon, exitDungeon, poseRig, buildRig, PROJ, ICON_CACHE });
+Object.assign(window.__G, { hurt, kill, spawnEnemy, updateAI, updatePlayer, step, castSpell, stats, consume, meleeStrike, restAtFire, respawnAtFire, readTome, useHot, equip, freshState, snapshot, applySave, applyWorldState, fireBolt, findInteract, onKey, newGame, loadGame, toTitle, saveGame, playerDeath, tickStatus, fireMenu, bossMove, spawnAllEnemies, openChest, enterDungeon, exitDungeon, poseRig, buildRig, PROJ, ICON_CACHE, Actor, LOOKS, groundAt });
 
 })();
 </script>
